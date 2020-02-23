@@ -371,7 +371,7 @@ def pixiv_sync():
 
 @pixiv_sync.command()
 @click.option('-C', '--config-file', help='The YAML config file.',
-              required=True)
+              default='config.yml', required=True)
 @click.argument('token', required=True)
 def set_token(config_file, token):
     # validate the token
@@ -387,7 +387,7 @@ def set_token(config_file, token):
 
 @pixiv_sync.command()
 @click.option('-C', '--config-file', help='The YAML config file.',
-              required=True)
+              default='config.yml', required=True)
 def sync_list(config_file):
     """Synchronize the illustration list."""
     config = load_config_file(config_file)
@@ -401,7 +401,7 @@ def sync_list(config_file):
 
 @pixiv_sync.command()
 @click.option('-C', '--config-file', help='The YAML config file.',
-              required=True)
+              default='config.yml', required=True)
 def sync_images(config_file):
     """Synchronize the illustration images."""
     config = load_config_file(config_file)
@@ -446,7 +446,7 @@ def sync_images(config_file):
 
 @pixiv_sync.command()
 @click.option('-C', '--config-file', help='The YAML config file.',
-              required=True)
+              default='config.yml', required=True)
 def sync(config_file):
     # first, check the login token
     config = load_config_file(config_file)
