@@ -15,7 +15,10 @@ First, create a YAML configuration file.
 Here is an example: [example.yml](example.yml).
 
 Next, login with your web browser (like Chrome), and copy the login token 
-from the browser (it should be the value of the `PHPSESSID` cookie):
+from the browser.  It should be the value of the `PHPSESSID` cookie.
+You may see a tutorial at [tutorial/get-pixiv-token.mp4](tutorial/get-pixiv-token.mp4).
+
+Then, save the token by:
 
 ```bash
 PixivSync set-token -C your-config.yml "your-token-value from web browser"
