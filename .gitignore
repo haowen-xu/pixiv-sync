@@ -3,6 +3,7 @@
 *.lock
 .DS_Store
 /var
+/config.yml
 
 
 # Created by https://www.gitignore.io/api/python

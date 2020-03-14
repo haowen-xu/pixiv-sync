@@ -169,12 +169,19 @@ class PixivMetaSpider(BasePixivSpider):
         re.compile(r'^(\d+)$'),
         re.compile(r'^https?://www\.pixiv\.net/users/(\d+)(?:/.*)?')
     ]
+    ILLUST_ID_PATTERNS = [
+        re.compile(r'/artworks/(\d+)(?:/.*)?$'),
+    ]
+
     start_author_ids: List[str]
 
-    def __init__(self, config: Dict[str, Any], sync_db: SyncDB):
+    def __init__(self, config: Dict[str, Any], sync_db: SyncDB, full_sync: bool):
         super().__init__(config, sync_db)
 
         self.start_author_ids = []
+        self.favourites = list(config.get('favourites', []))
+        self.full_sync = full_sync
+
         for author_id_or_url in config.get('authors', []):
             author_id = None
             for pattern in self.AUTHOR_ID_PATTERNS:
@@ -188,15 +195,74 @@ class PixivMetaSpider(BasePixivSpider):
             self.start_author_ids.append(author_id)
 
     def start_requests(self):
+        for fav in self.favourites:
+            if fav in ['public', 'private']:
+                rest = {'public': 'show', 'private': 'hide'}[fav]
+                yield scrapy.Request(
+                    url=f'https://www.pixiv.net/bookmark.php?rest={rest}&p=1',
+                    callback=self.parse_favourite_page,
+                    headers=self.headers,
+                    cookies=self.cookies,
+                    meta={'rest': rest, 'p': 1}
+                )
+
         for author_id in self.start_author_ids:
-            request = scrapy.Request(
+            yield scrapy.Request(
                 url=f'https://www.pixiv.net/ajax/user/{author_id}/profile/all',
                 callback=self.parse_author_profile_ajax,
                 headers=self.headers,
                 cookies=self.cookies,
                 meta={'author_id': author_id}
             )
-            yield request
+
+    def _make_illust_requests(self, illust_id: str):
+        illust_item = self.sync_db.get_illust(illust_id, {})
+        if 'title' not in illust_item:
+            yield Request(
+                url=f'https://www.pixiv.net/artworks/{illust_id}',
+                callback=self.parse_illust_page,
+                headers=self.headers,
+                cookies=self.cookies,
+                meta={'illust_id': illust_id}
+            )
+        if 'images' not in illust_item:
+            yield Request(
+                url=f'https://www.pixiv.net/ajax/illust/{illust_id}/pages',
+                callback=self.parse_illust_images_ajax,
+                headers=self.headers,
+                cookies=self.cookies,
+                meta={'illust_id': illust_id},
+            )
+
+    def parse_favourite_page(self, response: Response):
+        rest, p = response.meta['rest'], response.meta['p']
+        links = response.css('div.display_editable_works li.image-item > a.work ::attr(href)')
+        new_count = total_count = 0
+
+        for illust_link in links:
+            illust_url = illust_link.get()
+            illust_id = None
+            for illust_id_pattern in self.ILLUST_ID_PATTERNS:
+                m = illust_id_pattern.search(illust_url)
+                if m:
+                    illust_id = m.group(1)
+                    break
+            if illust_id is not None:
+                requests = list(self._make_illust_requests(illust_id))
+                if requests:
+                    new_count += 1
+                    yield from requests
+
+            total_count += 1
+
+        if new_count > 0 or (self.full_sync and total_count > 0):
+            yield scrapy.Request(
+                url=f'https://www.pixiv.net/bookmark.php?rest={rest}&p={p+1}',
+                callback=self.parse_favourite_page,
+                headers=self.headers,
+                cookies=self.cookies,
+                meta={'rest': rest, 'p': p+1}
+            )
 
     def parse_author_profile_ajax(self, response: Response):
         author_id = response.meta['author_id']
@@ -209,23 +275,7 @@ class PixivMetaSpider(BasePixivSpider):
 
         illusts = content.get('body', {}).get('illusts', [])
         for illust_id in illusts:
-            illust_item = self.sync_db.get_illust(illust_id, {})
-            if 'title' not in illust_item:
-                yield Request(
-                    url=f'https://www.pixiv.net/artworks/{illust_id}',
-                    callback=self.parse_illust_page,
-                    headers=self.headers,
-                    cookies=self.cookies,
-                    meta={'illust_id': illust_id}
-                )
-            if 'images' not in illust_item:
-                yield Request(
-                    url=f'https://www.pixiv.net/ajax/illust/{illust_id}/pages',
-                    callback=self.parse_illust_images_ajax,
-                    headers=self.headers,
-                    cookies=self.cookies,
-                    meta={'illust_id': illust_id},
-                )
+            yield from self._make_illust_requests(illust_id)
 
     def parse_illust_page(self, response: Response):
         illust_id = response.meta['illust_id']
@@ -380,6 +430,9 @@ def set_token(config_file, token):
 
     # set the token
     config = load_config_file(config_file)
+    parent_dir = os.path.split(os.path.abspath(config['sync.db']))[0]
+    if not os.path.isdir(parent_dir):
+        os.makedirs(parent_dir, exist_ok=True)
     sync_db = SyncDB(config['sync.db'])
     with sync_db:
         sync_db.set_cookies(cookies)
@@ -388,14 +441,15 @@ def set_token(config_file, token):
 @pixiv_sync.command()
 @click.option('-C', '--config-file', help='The YAML config file.',
               default='config.yml', required=True)
-def sync_list(config_file):
+@click.option('--full-sync', is_flag=True, default=False)
+def sync_list(config_file, full_sync):
     """Synchronize the illustration list."""
     config = load_config_file(config_file)
     sync_db = SyncDB(config['sync.db'])
     with sync_db:
         print('Fetching new illustrations list ...')
         process = CrawlerProcess()
-        process.crawl(PixivMetaSpider, config, sync_db)
+        process.crawl(PixivMetaSpider, config, sync_db, full_sync)
         process.start()
 
 

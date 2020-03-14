@@ -5,6 +5,8 @@ download.dir: ./var/images  # root path the download directory
 
 http.headers:
 
-authors:  # list of authors whose illustrations should be downloaded
-  - https://www.pixiv.net/users/13379747  # himitsu
-  - https://www.pixiv.net/users/3452804  # haneru
+#favourites: [public, private]  # which favourite collections to fetch?
+
+#authors:  # list of authors whose illustrations should be downloaded
+#  - https://www.pixiv.net/users/13379747  # himitsu
+#  - https://www.pixiv.net/users/3452804  # haneru
