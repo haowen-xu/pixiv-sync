@@ -6,9 +6,11 @@ import shutil
 import subprocess
 import sys
 import threading
+import traceback
 import urllib
 from dataclasses import dataclass
 from datetime import datetime
+from pprint import pprint
 from typing import *
 from urllib.request import urlopen
 
@@ -138,6 +140,22 @@ class SyncDB(object):
         self._update_dict('users', user_id, val)
 
 
+def is_illust_excluded(config, illust):
+    # test authors
+    exclude_authors = set(config.get('excludes', {}).get('authors', []))
+    for k in ('author_id', 'author_name'):
+        if (k in illust) and (illust[k] in exclude_authors):
+            return True
+
+    # test tags
+    exclude_tags = set(config.get('excludes', {}).get('tags', []))
+    for tag in illust.get('tags', []):
+        for k in ('name', 'translation'):
+            if (k in tag) and (tag[k] in exclude_tags):
+                return True
+    return False
+
+
 class BasePixivSpider(scrapy.Spider):
 
     DEFAULT_HEADERS: Dict[str, str] = {
@@ -217,22 +235,23 @@ class PixivMetaSpider(BasePixivSpider):
 
     def _make_illust_requests(self, illust_id: str):
         illust_item = self.sync_db.get_illust(illust_id, {})
-        if 'title' not in illust_item:
-            yield Request(
-                url=f'https://www.pixiv.net/artworks/{illust_id}',
-                callback=self.parse_illust_page,
-                headers=self.headers,
-                cookies=self.cookies,
-                meta={'illust_id': illust_id}
-            )
-        if 'images' not in illust_item:
-            yield Request(
-                url=f'https://www.pixiv.net/ajax/illust/{illust_id}/pages',
-                callback=self.parse_illust_images_ajax,
-                headers=self.headers,
-                cookies=self.cookies,
-                meta={'illust_id': illust_id},
-            )
+        if not illust_item.get('_deleted'):
+            if 'title' not in illust_item:
+                yield Request(
+                    url=f'https://www.pixiv.net/artworks/{illust_id}',
+                    callback=self.parse_illust_page,
+                    headers=self.headers,
+                    cookies=self.cookies,
+                    meta={'illust_id': illust_id}
+                )
+            if 'images' not in illust_item:
+                yield Request(
+                    url=f'https://www.pixiv.net/ajax/illust/{illust_id}/pages',
+                    callback=self.parse_illust_images_ajax,
+                    headers=self.headers,
+                    cookies=self.cookies,
+                    meta={'illust_id': illust_id},
+                )
 
     def parse_favourite_page(self, response: Response):
         rest, p = response.meta['rest'], response.meta['p']
@@ -252,7 +271,6 @@ class PixivMetaSpider(BasePixivSpider):
                 if requests:
                     new_count += 1
                     yield from requests
-
             total_count += 1
 
         if new_count > 0 or (self.full_sync and total_count > 0):
@@ -312,6 +330,8 @@ class PixivMetaSpider(BasePixivSpider):
             'author_name': illust_data.get('userName', ''),
             'tags': get_tags()
         })
+        if is_illust_excluded(self.config, item):
+            item['_deleted'] = True
         if item:
             self.sync_db.update_illust(illust_id, item)
 
@@ -466,6 +486,9 @@ def sync_images(config_file):
         image_jobs: List[FetchImageJob] = []
         for illust_id in sync_db.get_illust_ids():
             illust = sync_db.get_illust(illust_id, {})
+            if illust.get('_deleted', False):
+                continue
+
             author_name = illust['author_name']
             parent_dir = os.path.join(download_dir, author_name)
 
@@ -496,6 +519,104 @@ def sync_images(config_file):
             process = CrawlerProcess()
             process.crawl(PixivImagesSpider, config, sync_db, image_jobs)
             process.start()
+
+
+@pixiv_sync.command()
+@click.option('-C', '--config-file', help='The YAML config file.',
+              default='config.yml', required=True)
+@click.argument('illust_ids', nargs=-1)
+def info(config_file, illust_ids):
+    """Show illust info."""
+    config = load_config_file(config_file)
+    sync_db = SyncDB(config['sync.db'])
+
+    with sync_db:
+        for illust_id in illust_ids:
+            title = f'Info for {illust_id}'
+            print(title + '\n' + '-' * len(title))
+            pprint(sync_db.get_illust(illust_id))
+            print('')
+
+
+def _remove_illust(download_dir, sync_db, illust_ids):
+    for illust_id in illust_ids:
+        illust = sync_db.get_illust(illust_id)
+        if illust:
+            author_name = illust['author_name']
+            parent_dir = os.path.join(download_dir, author_name)
+            remove_parent_dir = False
+
+            images = illust.get('images', [])
+            if len(images) > 1:
+                parent_dir = os.path.join(parent_dir, illust_id)
+                remove_parent_dir = True
+
+            for i, image in enumerate(
+                    sync_db.get_illust(illust_id, {}).get('images')):
+                if not image.get('fetched', False):
+                    continue
+                image_url = image['url']
+                file_name = image_url.rsplit('/', 1)[-1]
+                file_path = os.path.join(parent_dir, file_name)
+
+                if os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                        print(f'Removed: {file_path}')
+                    except Exception:
+                        print(f'Failed to remove: {file_path}')
+                        print(''.join(traceback.format_exception(*sys.exc_info())))
+
+            if remove_parent_dir and os.path.exists(parent_dir):
+                try:
+                    shutil.rmtree(parent_dir)
+                except Exception:
+                    print(f'Failed to rmtree: {parent_dir}')
+                    print(''.join(traceback.format_exception(*sys.exc_info())))
+
+            sync_db.update_illust(illust_id, {'_deleted': True})
+
+
+@pixiv_sync.command()
+@click.option('-C', '--config-file', help='The YAML config file.',
+              default='config.yml', required=True)
+@click.argument('illust_ids', nargs=-1)
+def remove(config_file, illust_ids):
+    """Delete illusts."""
+    config = load_config_file(config_file)
+    sync_db = SyncDB(config['sync.db'])
+    download_dir = os.path.abspath(config['download.dir'])
+
+    with sync_db:
+        _remove_illust(download_dir, sync_db, illust_ids)
+
+
+@pixiv_sync.command()
+@click.option('-C', '--config-file', help='The YAML config file.',
+              default='config.yml', required=True)
+@click.option('-S', '--simulate', is_flag=True, default=False)
+@click.option('-I', '--show-info', is_flag=True, default=False)
+def remove_excluded(config_file, simulate, show_info):
+    """Delete excluded illusts."""
+    config = load_config_file(config_file)
+    sync_db = SyncDB(config['sync.db'])
+    download_dir = os.path.abspath(config['download.dir'])
+    delete_ids = []
+
+    with sync_db:
+        for illust_id in sync_db.get_illust_ids():
+            illust = sync_db.get_illust(illust_id, {})
+            if not illust.get('_deleted', False) and is_illust_excluded(config, illust):
+                delete_ids.append(illust_id)
+                if show_info:
+                    title = f'Info for {illust_id}'
+                    print(title + '\n' + '-' * len(title))
+                    pprint(sync_db.get_illust(illust_id))
+                    print('')
+
+        print(f'Found {len(delete_ids)} illusts to remove.')
+        if not simulate:
+            _remove_illust(download_dir, sync_db, delete_ids)
 
 
 @pixiv_sync.command()
