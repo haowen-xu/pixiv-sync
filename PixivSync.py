@@ -501,7 +501,8 @@ def sync_images(config_file):
 @pixiv_sync.command()
 @click.option('-C', '--config-file', help='The YAML config file.',
               default='config.yml', required=True)
-def sync(config_file):
+@click.option('--full-sync', is_flag=True, default=False)
+def sync(config_file, full_sync):
     # first, check the login token
     config = load_config_file(config_file)
     sync_db = SyncDB(config['sync.db'])
@@ -511,7 +512,8 @@ def sync(config_file):
 
     # next, do synchronization
     args_prefix = [sys.executable, os.path.abspath(__file__)]
-    subprocess.check_call(args_prefix + ['sync-list', '-C', config_file])
+    sync_list_args = ['--full-sync'] if full_sync else []
+    subprocess.check_call(args_prefix + ['sync-list', '-C', config_file] + sync_list_args)
     subprocess.check_call(args_prefix + ['sync-images', '-C', config_file])
 
 
