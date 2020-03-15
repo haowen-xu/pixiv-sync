@@ -551,8 +551,7 @@ def _remove_illust(download_dir, sync_db, illust_ids):
                 parent_dir = os.path.join(parent_dir, illust_id)
                 remove_parent_dir = True
 
-            for i, image in enumerate(
-                    sync_db.get_illust(illust_id, {}).get('images')):
+            for i, image in enumerate(images):
                 if not image.get('fetched', False):
                     continue
                 image_url = image['url']
@@ -617,6 +616,53 @@ def remove_excluded(config_file, simulate, show_info):
         print(f'Found {len(delete_ids)} illusts to remove.')
         if not simulate:
             _remove_illust(download_dir, sync_db, delete_ids)
+
+
+def _count_db(sync_db, download_dir):
+    counts = {
+        'illust': [],
+        'deleted_illust': [],
+        'images': [],
+        'deleted_images': [],
+        'not_exist_images': [],
+        'not_deleted_images': [],
+    }
+    for illust_id in sync_db.get_illust_ids():
+        illust = sync_db.get_illust(illust_id, {})
+        deleted = illust.get('_deleted')
+        counts['deleted_illust' if deleted else 'illust'].append(illust_id)
+
+        author_name = illust['author_name']
+        parent_dir = os.path.join(download_dir, author_name)
+        images = illust.get('images', [])
+        if len(images) > 1:
+            parent_dir = os.path.join(parent_dir, illust_id)
+
+        for i, image in enumerate(images):
+            image_url = image['url']
+            file_name = image_url.rsplit('/', 1)[-1]
+            file_path = os.path.join(parent_dir, file_name)
+
+            if os.path.exists(file_path):
+                counts['not_deleted_images' if deleted else 'images'].append(file_path)
+            else:
+                counts['deleted_images' if deleted else 'not_exist_images'].append(file_path)
+
+    return counts
+
+
+@pixiv_sync.command()
+@click.option('-C', '--config-file', help='The YAML config file.',
+              default='config.yml', required=True)
+def count(config_file):
+    """Count downloaded illusts."""
+    config = load_config_file(config_file)
+    sync_db = SyncDB(config['sync.db'])
+    download_dir = os.path.abspath(config['download.dir'])
+
+    with sync_db:
+        counts = _count_db(sync_db, download_dir)
+        pprint({k: len(counts[k]) for k in counts})
 
 
 @pixiv_sync.command()
