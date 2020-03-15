@@ -140,19 +140,39 @@ class SyncDB(object):
         self._update_dict('users', user_id, val)
 
 
-def is_illust_excluded(config, illust):
-    # test authors
-    exclude_authors = set(config.get('excludes', {}).get('authors', []))
-    for k in ('author_id', 'author_name'):
-        if (k in illust) and (illust[k] in exclude_authors):
-            return True
+def is_set_intersect(a, b):
+    if not isinstance(b, set):
+        b = set(b)
+    return any(i in b for i in a)
 
-    # test tags
-    exclude_tags = set(config.get('excludes', {}).get('tags', []))
+
+def is_illust_excluded(config, illust):
+    # gather illust values
+    info = {
+        'authors': [illust[k] for k in ('author_id', 'author_name')
+                    if k in illust],
+        'tags': []
+    }
     for tag in illust.get('tags', []):
         for k in ('name', 'translation'):
-            if (k in tag) and (tag[k] in exclude_tags):
-                return True
+            if k in tag:
+                info['tags'].append(tag[k])
+
+    # test against rules
+    includes = config.get('includes', {})
+    includes = {k: includes[k] for k in info if k in includes}
+    excludes = config.get('excludes', {})
+    excludes = {k: excludes[k] for k in info if k in excludes}
+
+    if includes:
+        if not any(is_set_intersect(info[k], includes[k]) for k in includes):
+            return True
+
+    if excludes:
+        if any(is_set_intersect(info[k], excludes[k]) for k in excludes):
+            return True
+
+    # default action
     return False
 
 
@@ -235,23 +255,23 @@ class PixivMetaSpider(BasePixivSpider):
 
     def _make_illust_requests(self, illust_id: str):
         illust_item = self.sync_db.get_illust(illust_id, {})
-        if not illust_item.get('_deleted'):
-            if 'title' not in illust_item:
-                yield Request(
-                    url=f'https://www.pixiv.net/artworks/{illust_id}',
-                    callback=self.parse_illust_page,
-                    headers=self.headers,
-                    cookies=self.cookies,
-                    meta={'illust_id': illust_id}
-                )
-            if 'images' not in illust_item:
-                yield Request(
-                    url=f'https://www.pixiv.net/ajax/illust/{illust_id}/pages',
-                    callback=self.parse_illust_images_ajax,
-                    headers=self.headers,
-                    cookies=self.cookies,
-                    meta={'illust_id': illust_id},
-                )
+        if 'title' not in illust_item:
+            yield Request(
+                url=f'https://www.pixiv.net/artworks/{illust_id}',
+                callback=self.parse_illust_page,
+                headers=self.headers,
+                cookies=self.cookies,
+                meta={'illust_id': illust_id}
+            )
+
+        if 'images' not in illust_item:
+            yield Request(
+                url=f'https://www.pixiv.net/ajax/illust/{illust_id}/pages',
+                callback=self.parse_illust_images_ajax,
+                headers=self.headers,
+                cookies=self.cookies,
+                meta={'illust_id': illust_id},
+            )
 
     def parse_favourite_page(self, response: Response):
         rest, p = response.meta['rest'], response.meta['p']
@@ -330,8 +350,7 @@ class PixivMetaSpider(BasePixivSpider):
             'author_name': illust_data.get('userName', ''),
             'tags': get_tags()
         })
-        if is_illust_excluded(self.config, item):
-            item['_deleted'] = True
+        item['_deleted'] = is_illust_excluded(self.config, item)
         if item:
             self.sync_db.update_illust(illust_id, item)
 
@@ -471,6 +490,14 @@ def sync_list(config_file, full_sync):
         process = CrawlerProcess()
         process.crawl(PixivMetaSpider, config, sync_db, full_sync)
         process.start()
+
+        # update "_deleted"
+        for illust_id in sync_db.get_illust_ids():
+            illust = sync_db.get_illust(illust_id, {})
+            sync_db.update_illust(
+                illust_id,
+                {'_deleted': is_illust_excluded(config, illust)}
+            )
 
 
 @pixiv_sync.command()
