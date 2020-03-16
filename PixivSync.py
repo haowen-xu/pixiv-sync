@@ -129,9 +129,9 @@ class SyncDB(object):
     def update_illust(self, illust_id: str, val: Dict[str, Any]):
         self._update_dict('illusts', illust_id, val)
 
-    def set_illust_fetched(self, illust_id: str, image_id: int):
+    def set_illust_fetched(self, illust_id: str, image_id: int, fetched: bool = True):
         with self.lock:
-            self['illusts'][illust_id]['images'][image_id]['fetched'] = True
+            self['illusts'][illust_id]['images'][image_id]['fetched'] = fetched
 
     def get_user(self, user_id: str, default=None):
         return self._get_dict('users', user_id, default)
@@ -584,14 +584,19 @@ def _remove_illust(download_dir, sync_db, illust_ids):
                 image_url = image['url']
                 file_name = image_url.rsplit('/', 1)[-1]
                 file_path = os.path.join(parent_dir, file_name)
+                is_removed = not os.path.exists(file_path)
 
-                if os.path.exists(file_path):
+                if not is_removed:
                     try:
                         os.remove(file_path)
+                        is_removed = True
                         print(f'Removed: {file_path}')
                     except Exception:
                         print(f'Failed to remove: {file_path}')
                         print(''.join(traceback.format_exception(*sys.exc_info())))
+
+                if is_removed:
+                    sync_db.set_illust_fetched(illust_id, i, False)
 
             if remove_parent_dir and os.path.exists(parent_dir):
                 try:
