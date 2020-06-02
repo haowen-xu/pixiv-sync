@@ -229,34 +229,47 @@ def extract_illust_data(illust) -> Dict[str, Any]:
     # parse single page illust
     p_data = illust['meta_single_page']
     if p_data:
-        images.append(filter_dict({
+        images.append({
             'url': p_data['original_image_url'],
-        }))
+        })
     else:
         for p_data in illust['meta_pages']:
-            images.append(filter_dict({
+            images.append({
                 'url': p_data['image_urls']['original'],
-            }))
+            })
 
-    r = filter_dict({
+    r = {
         'id': str(illust['id']),
         'title': illust['title'],
         'create_time': illust['create_date'],
         'author_id': str(illust['user']['id']),
         'author_name': illust['user']['name'],
         'tags': get_tags(illust),
-        'width': illust.get('width', None),
-        'height': illust.get('height', None),
+        'width': illust['width'],
+        'height': illust['height'],
         'images': images,
-    })
+    }
+    if any(not v for v in r):
+        raise ValueError(f'Malformed response: {r}')
     return r
 
 
-def update_list(sync_db: SyncDB, config: Dict[str, Any]):
+def update_list(sync_db: SyncDB, config: Dict[str, Any],
+                max_bookmark_id: Optional[str] = None):
     """Pull the new illustrations that should be downloaded."""
+    def store_illust(illust, counter):
+        illust_id = str(illust['id'])
+        if not sync_db.get_illust(illust_id):
+            item = extract_illust_data(illust)
+            item['_deleted'] = is_illust_excluded(config, item)
+            if item:
+                sync_db.update_illust(illust_id, item)
+                counter += 1
+        return counter
+
     api = make_api_client(sync_db)
 
-    # get new illustrations list
+    # get new illustrations list from interested authors
     for author_id_or_url in config.get('authors', []):
         author_id = None
         for pattern in AUTHOR_ID_PATTERNS:
@@ -270,7 +283,7 @@ def update_list(sync_db: SyncDB, config: Dict[str, Any]):
 
         print(f'> Pull from: {author_id_or_url}')
         offset = 0
-        new_illusts = 0
+        new_counter = 0
         try:
             while True:
                 r = api.user_illusts(author_id, offset=offset)
@@ -280,13 +293,7 @@ def update_list(sync_db: SyncDB, config: Dict[str, Any]):
                 if not illusts:
                     break
                 for illust in illusts:
-                    illust_id = str(illust['id'])
-                    if not sync_db.get_illust(illust_id):
-                        item = extract_illust_data(illust)
-                        item['_deleted'] = is_illust_excluded(config, item)
-                        if item:
-                            sync_db.update_illust(illust_id, item)
-                            new_illusts += 1
+                    new_counter = store_illust(illust, new_counter)
                 offset += len(illusts)
 
         except Exception:
@@ -294,7 +301,51 @@ def update_list(sync_db: SyncDB, config: Dict[str, Any]):
                   f'Failed to call `api.user_illusts`: user_id={author_id}, '
                   f'offset={offset}.')
 
-        print(f'Discovered {new_illusts} new illusts.')
+        if new_counter > 0:
+            print(f'Discovered {new_counter} new illusts.')
+
+    # get new illustrations from user's bookmarks
+    the_max_bookmark_id = max_bookmark_id
+    if api.user_id:
+        for fav in config.get('favourites', []):
+            if fav not in ('public', 'private'):
+                raise ValueError(f'Unknown favourite type: {fav}')
+
+            max_bookmark_id = the_max_bookmark_id
+            new_counter = 0
+
+            while True:
+                print(f'> Pull from bookmark: {fav} (max_bookmark_id={max_bookmark_id})')
+                r = api.user_bookmarks_illust(
+                    api.user_id, restrict=fav, max_bookmark_id=max_bookmark_id)
+                if 'error' in r:
+                    raise Exception(r['error']['message'] or r['error']['user_message'])
+
+                # parse the illustrations
+                illusts = r['illusts']
+                if not illusts:
+                    break
+
+                old_new_counter = new_counter
+                for illust in illusts:
+                    new_counter = store_illust(illust, new_counter)
+
+                # if no new illusts on this page, stop pulling
+                if old_new_counter == new_counter:
+                    break
+                else:
+                    print(f'Discovered {new_counter - old_new_counter} new illusts.')
+
+                # parse the next bookmark
+                next_url = r['next_url']
+                if next_url:
+                    m = re.match(r'.*[?&]max_bookmark_id=(\d+)(?:&|$)', next_url)
+                    if m:
+                        max_bookmark_id = m.group(1)
+                    else:
+                        break
+    else:
+        print('! User not logged in, bookmarks disabled.')
 
     # update "_deleted"
     for illust_id in sync_db.get_illust_ids():
@@ -356,6 +407,10 @@ def fetch_images(sync_db: SyncDB, download_dir: str, n_workers: int):
                 name=name,
                 replace=True,
             )
+            with f_lock:
+                counter[0] -= 1
+                sync_db.set_illust_fetched(job.illust_id, job.image_id)
+                print(f'[{counter[0]}/{len(image_jobs)}] done: {job.image_url}')
         except:
             try:
                 os.remove(job.file_path)
@@ -363,11 +418,6 @@ def fetch_images(sync_db: SyncDB, download_dir: str, n_workers: int):
                 pass
             print(''.join(traceback.format_exception(*sys.exc_info())) +
                   f'Failed to download: {job.image_url}')
-        else:
-            with f_lock:
-                counter[0] -= 1
-                sync_db.set_illust_fetched(job.illust_id, job.image_id)
-                print(f'[{counter[0]}/{len(image_jobs)}] done: {job.image_url}')
 
     if image_jobs:
         print(f'> Fetching {len(image_jobs)} images ...')
@@ -471,16 +521,21 @@ def login(config_file, username, password):
 @pixiv_sync.command()
 @click.option('-C', '--config-file', help='The YAML config file.',
               default='config.yml', required=True)
-def sync(config_file):
+@click.option('--list-only', is_flag=True, default=False)
+@click.option('--fetch-only', is_flag=True, default=False)
+@click.option('--max-bookmark-id', required=False, default=None)
+def sync(config_file, list_only, fetch_only, max_bookmark_id):
     """Synchronize the illustrations."""
     config = load_config_file(config_file)
     download_dir = os.path.abspath(config['download.dir'])
     n_workers = config.get('download.workers', 8)
 
     with SyncDB(config['sync.db']) as sync_db:
-        update_list(sync_db, config)
-        print('')
-        fetch_images(sync_db, download_dir, n_workers)
+        if not fetch_only:
+            update_list(sync_db, config, max_bookmark_id=max_bookmark_id)
+        if not list_only:
+            print('')
+            fetch_images(sync_db, download_dir, n_workers)
 
 
 @pixiv_sync.command()
@@ -531,10 +586,8 @@ def remove_excluded(config_file, simulate, show_info):
 def count(config_file):
     """Count downloaded illusts."""
     config = load_config_file(config_file)
-    sync_db = SyncDB(config['sync.db'])
     download_dir = os.path.abspath(config['download.dir'])
-
-    with sync_db:
+    with SyncDB(config['sync.db']) as sync_db:
         counts = _count_db(sync_db, download_dir)
         pprint({k: len(counts[k]) for k in counts})
 
