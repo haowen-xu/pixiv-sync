@@ -1,34 +1,24 @@
+#!/usr/bin/env python
+
 import json
 import os
 import codecs
 import re
 import shutil
-import subprocess
 import sys
 import threading
 import traceback
-import urllib
 from dataclasses import dataclass
 from datetime import datetime
-from pprint import pprint
+from multiprocessing.pool import ThreadPool
 from typing import *
-from urllib.request import urlopen
 
 import click
-import scrapy
 import yaml
-from scrapy.crawler import CrawlerProcess
-from scrapy.http import Request, Response
+from pprint import pprint
+from pixivpy3 import AppPixivAPI
 
-__version__ = '0.0.1'
-PIXIV_TOKEN_COOKIE_NAME = 'PHPSESSID'
-
-
-def html_to_text(html: str):
-    html = BR_PATTERN.sub('\n', html)
-    return html
-
-BR_PATTERN = re.compile(r'<br[^<>]*>', re.I)
+__version__ = '0.0.2'
 
 
 class SyncDB(object):
@@ -79,6 +69,10 @@ class SyncDB(object):
                 for old_backup in backup_list[:len(backup_list) - max_backup]:
                     os.remove(os.path.join(parent_dir, old_backup))
 
+            parent_dir = os.path.split(self.path)[0]
+            if not os.path.isdir(parent_dir):
+                os.makedirs(parent_dir, exist_ok=True)
+
             with codecs.open(self.path, 'wb', 'utf-8') as f:
                 f.write(output_content)
 
@@ -101,11 +95,11 @@ class SyncDB(object):
         with self.lock:
             return self.data.get(key, default)
 
-    def get_cookies(self, default=None):
-        return self.get('cookies', default)
+    def get_token(self, default=None):
+        return self.get('token', default)
 
-    def set_cookies(self, val: Dict[str, str]):
-        self['cookies'] = val
+    def set_token(self, val: Dict[str, str]):
+        self['token'] = val
 
     def get_illust_ids(self):
         with self.lock:
@@ -176,256 +170,6 @@ def is_illust_excluded(config, illust):
     return False
 
 
-class BasePixivSpider(scrapy.Spider):
-
-    DEFAULT_HEADERS: Dict[str, str] = {
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/apng,*/*;q=0.8,v=b3;q=0.9',
-        'Accept-Encoding': 'gzip, deflate',
-        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.130 Safari/537.36',
-    }
-
-    config: Dict[str, any]
-    sync_db: SyncDB
-    headers: Dict[str, Any]
-    cookies: Dict[str, Any]
-
-    def __init__(self, config: Dict[str, Any], sync_db: SyncDB):
-        super().__init__(name=self.__class__.__qualname__)
-        self.config = config
-        self.sync_db = sync_db
-        self.headers = dict(config.get('http.headers') or ())
-        self.cookies = dict(sync_db.get_cookies() or ())
-
-        for k, v in self.DEFAULT_HEADERS.items():
-            self.headers.setdefault(k, v)
-
-
-class PixivMetaSpider(BasePixivSpider):
-
-    AUTHOR_ID_PATTERNS = [
-        re.compile(r'^(\d+)$'),
-        re.compile(r'^https?://www\.pixiv\.net/users/(\d+)(?:/.*)?')
-    ]
-    ILLUST_ID_PATTERNS = [
-        re.compile(r'/artworks/(\d+)(?:/.*)?$'),
-    ]
-
-    start_author_ids: List[str]
-
-    def __init__(self, config: Dict[str, Any], sync_db: SyncDB, full_sync: bool):
-        super().__init__(config, sync_db)
-
-        self.start_author_ids = []
-        self.favourites = list(config.get('favourites', []))
-        self.full_sync = full_sync
-
-        for author_id_or_url in config.get('authors', []):
-            author_id = None
-            for pattern in self.AUTHOR_ID_PATTERNS:
-                m = pattern.match(author_id_or_url)
-                if m:
-                    author_id = m.group(1)
-                    break
-            if author_id is None:
-                raise ValueError(f'No author ID can be recognized from: '
-                                 f'{author_id_or_url}')
-            self.start_author_ids.append(author_id)
-
-    def start_requests(self):
-        for fav in self.favourites:
-            if fav in ['public', 'private']:
-                rest = {'public': 'show', 'private': 'hide'}[fav]
-                yield scrapy.Request(
-                    url=f'https://www.pixiv.net/bookmark.php?rest={rest}&p=1',
-                    callback=self.parse_favourite_page,
-                    headers=self.headers,
-                    cookies=self.cookies,
-                    meta={'rest': rest, 'p': 1}
-                )
-
-        for author_id in self.start_author_ids:
-            yield scrapy.Request(
-                url=f'https://www.pixiv.net/ajax/user/{author_id}/profile/all',
-                callback=self.parse_author_profile_ajax,
-                headers=self.headers,
-                cookies=self.cookies,
-                meta={'author_id': author_id}
-            )
-
-    def _make_illust_requests(self, illust_id: str):
-        illust_item = self.sync_db.get_illust(illust_id, {})
-        if 'title' not in illust_item:
-            yield Request(
-                url=f'https://www.pixiv.net/artworks/{illust_id}',
-                callback=self.parse_illust_page,
-                headers=self.headers,
-                cookies=self.cookies,
-                meta={'illust_id': illust_id}
-            )
-
-        if 'images' not in illust_item:
-            yield Request(
-                url=f'https://www.pixiv.net/ajax/illust/{illust_id}/pages',
-                callback=self.parse_illust_images_ajax,
-                headers=self.headers,
-                cookies=self.cookies,
-                meta={'illust_id': illust_id},
-            )
-
-    def parse_favourite_page(self, response: Response):
-        rest, p = response.meta['rest'], response.meta['p']
-        links = response.css('div.display_editable_works li.image-item > a.work ::attr(href)')
-        new_count = total_count = 0
-
-        for illust_link in links:
-            illust_url = illust_link.get()
-            illust_id = None
-            for illust_id_pattern in self.ILLUST_ID_PATTERNS:
-                m = illust_id_pattern.search(illust_url)
-                if m:
-                    illust_id = m.group(1)
-                    break
-            if illust_id is not None:
-                requests = list(self._make_illust_requests(illust_id))
-                if requests:
-                    new_count += 1
-                    yield from requests
-            total_count += 1
-
-        if new_count > 0 or (self.full_sync and total_count > 0):
-            yield scrapy.Request(
-                url=f'https://www.pixiv.net/bookmark.php?rest={rest}&p={p+1}',
-                callback=self.parse_favourite_page,
-                headers=self.headers,
-                cookies=self.cookies,
-                meta={'rest': rest, 'p': p+1}
-            )
-
-    def parse_author_profile_ajax(self, response: Response):
-        author_id = response.meta['author_id']
-        content = json.loads(response.body_as_unicode())
-        if content['error']:
-            raise RuntimeError(
-                f'Failed to load illusts of author {author_id}: '
-                f'{content["message"]}'
-            )
-
-        illusts = content.get('body', {}).get('illusts', [])
-        for illust_id in illusts:
-            yield from self._make_illust_requests(illust_id)
-
-    def parse_illust_page(self, response: Response):
-        illust_id = response.meta['illust_id']
-        preload_data = response.css('#meta-preload-data ::attr(content)')[0].get()
-        preload_data = json.loads(preload_data)
-        illust_data = preload_data['illust'][illust_id]
-
-        def filter_dict(d):
-            return {k: v for k, v in d.items() if v}
-
-        def get_tags():
-            tags = []
-            for t in illust_data.get('tags', {}).get('tags', []):
-                t_name = t.get('tag')
-                if not t_name:
-                    continue
-                t_romaji = t.get('romaji')
-                t_translation = t.get('translation', {}).get('en', '')
-                tags.append(filter_dict({
-                    'name': t_name,
-                    'romaji': t_romaji,
-                    'translation': t_translation
-                }))
-            return tags
-
-        item = filter_dict({
-            'id': illust_data['id'],
-            'title': illust_data['title'],
-            'raw_description': illust_data.get('description', ''),
-            'description': html_to_text(illust_data.get('description', '')),
-            'create_time': illust_data.get('createDate', ''),
-            'update_time': illust_data.get('updateDate', ''),
-            'author_id': illust_data.get('userId', ''),
-            'author_name': illust_data.get('userName', ''),
-            'tags': get_tags()
-        })
-        item['_deleted'] = is_illust_excluded(self.config, item)
-        if item:
-            self.sync_db.update_illust(illust_id, item)
-
-    def parse_illust_images_ajax(self, response: Response):
-        illust_id = response.meta['illust_id']
-        content = json.loads(response.body_as_unicode())
-        if content['error']:
-            raise RuntimeError(
-                f'Failed to load images of illust {illust_id}: '
-                f'{content["message"]}'
-            )
-
-        images = []
-        for image in content.get('body', []):
-            images.append({
-                'url': image['urls']['original'],
-                'width': image['width'],
-                'height': image['height'],
-            })
-
-        with self.sync_db.lock:
-            self.sync_db.update_illust(illust_id, {'images': images})
-
-
-@dataclass
-class FetchImageJob(object):
-    file_path: str
-    image_url: str
-    illust_id: str
-    image_id: int
-
-
-class PixivImagesSpider(BasePixivSpider):
-
-    image_jobs: List[FetchImageJob]
-
-    def __init__(self,
-                 config: Dict[str, Any],
-                 sync_db: SyncDB,
-                 image_jobs: Iterable[FetchImageJob]):
-        super().__init__(config, sync_db)
-        self.image_jobs = list(image_jobs)
-
-    def start_requests(self):
-        for image_job in self.image_jobs:
-            headers = dict(self.headers)
-            headers['Referer'] = f'https://www.pixiv.net/artworks/{image_job.illust_id}'
-            request = scrapy.Request(
-                url=image_job.image_url,
-                callback=self.parse,
-                headers=headers,
-                cookies=self.cookies,
-                meta={'job': image_job}
-            )
-            yield request
-
-    def parse(self, response: Response):
-        job: FetchImageJob = response.meta['job']
-        parent_dir = os.path.split(job.file_path)[0]
-        if not os.path.isdir(parent_dir):
-            os.makedirs(parent_dir, exist_ok=True)
-        cnt = response.body
-        try:
-            with open(job.file_path, 'wb') as f:
-                f.write(cnt)
-        except Exception:
-            if os.path.exists(job.file_path):
-                try:
-                    os.remove(job.file_path)
-                except Exception:
-                    pass
-            raise
-        self.sync_db.set_illust_fetched(job.illust_id, job.image_id)
-
-
 def load_config_file(config_file: str) -> Dict[str, Any]:
     if os.path.exists(config_file):
         with codecs.open(config_file, 'rb', 'utf-8') as f:
@@ -438,131 +182,199 @@ def load_config_file(config_file: str) -> Dict[str, Any]:
         return data
 
 
-def get_logged_in_user_id(cookies):
-    headers = dict(BasePixivSpider.DEFAULT_HEADERS)
-    headers['Cookie'] = f'PHPSESSID={cookies["PHPSESSID"]}'
-    headers.pop('Accept-Encoding')
-
-    req = urllib.request.Request(
-        'https://www.pixiv.net', method='GET', headers=headers)
-    with urlopen(req) as resp:
-        cnt = resp.read().decode('utf-8')
-
-    if re.search(r'pixiv\.user\.loggedIn\s*=\s*true', cnt) is None:
-        raise RuntimeError('Login token is invalid. You may login again.')
-    return re.search(r'pixiv\.user\.id\s*=\s*"(\d+)"', cnt).group(1)
-
-
 @click.group()
 def pixiv_sync():
     """Pixiv illustrations sync tool."""
 
 
-@pixiv_sync.command()
-@click.option('-C', '--config-file', help='The YAML config file.',
-              default='config.yml', required=True)
-@click.argument('token', required=True)
-def set_token(config_file, token):
-    # validate the token
-    cookies = {PIXIV_TOKEN_COOKIE_NAME: token}
-    _ = get_logged_in_user_id(cookies)
-
-    # set the token
-    config = load_config_file(config_file)
-    parent_dir = os.path.split(os.path.abspath(config['sync.db']))[0]
-    if not os.path.isdir(parent_dir):
-        os.makedirs(parent_dir, exist_ok=True)
-    sync_db = SyncDB(config['sync.db'])
-    with sync_db:
-        sync_db.set_cookies(cookies)
+def make_api_client(sync_db: SyncDB) -> AppPixivAPI:
+    api = AppPixivAPI()
+    auth = sync_db.get_token()
+    keys = ('access_token', 'device_token', 'refresh_token', 'user')
+    if auth and all(k in auth for k in keys):
+        api.access_token = auth['access_token']
+        api.refresh_token = auth['refresh_token']
+        api.user_id = auth['user']['id']
+    return api
 
 
-@pixiv_sync.command()
-@click.option('-C', '--config-file', help='The YAML config file.',
-              default='config.yml', required=True)
-@click.option('--full-sync', is_flag=True, default=False)
-def sync_list(config_file, full_sync):
-    """Synchronize the illustration list."""
-    config = load_config_file(config_file)
-    sync_db = SyncDB(config['sync.db'])
-    with sync_db:
-        print('Fetching new illustrations list ...')
-        process = CrawlerProcess()
-        process.crawl(PixivMetaSpider, config, sync_db, full_sync)
-        process.start()
-
-        # update "_deleted"
-        for illust_id in sync_db.get_illust_ids():
-            illust = sync_db.get_illust(illust_id, {})
-            sync_db.update_illust(
-                illust_id,
-                {'_deleted': is_illust_excluded(config, illust)}
-            )
+AUTHOR_ID_PATTERNS = [
+    re.compile(r'^(\d+)$'),
+    re.compile(r'^https?://www\.pixiv\.net/users/(\d+)(?:/.*)?')
+]
+ILLUST_ID_PATTERNS = [
+    re.compile(r'/artworks/(\d+)(?:/.*)?$'),
+]
 
 
-@pixiv_sync.command()
-@click.option('-C', '--config-file', help='The YAML config file.',
-              default='config.yml', required=True)
-def sync_images(config_file):
-    """Synchronize the illustration images."""
-    config = load_config_file(config_file)
-    sync_db = SyncDB(config['sync.db'])
-    download_dir = os.path.abspath(config['download.dir'])
+def extract_illust_data(illust) -> Dict[str, Any]:
+    def filter_dict(d):
+        return {k: v for k, v in d.items() if v}
 
-    with sync_db:
-        image_jobs: List[FetchImageJob] = []
-        for illust_id in sync_db.get_illust_ids():
-            illust = sync_db.get_illust(illust_id, {})
-            if illust.get('_deleted', False):
+    def get_tags(illust_data):
+        tags = []
+        for t in illust_data.get('tags', []):
+            t_name = t.get('name')
+            if not t_name:
                 continue
+            t_translation = t.get('translated_name')
+            tags.append(filter_dict({
+                'name': t_name,
+                'translation': t_translation
+            }))
+        return tags
 
-            author_name = illust['author_name']
-            parent_dir = os.path.join(download_dir, author_name)
+    images = []
 
-            images = illust.get('images', [])
-            if len(images) > 1:
-                parent_dir = os.path.join(parent_dir, illust_id)
-            for i, image in enumerate(
-                    sync_db.get_illust(illust_id, {}).get('images')):
-                if image.get('fetched', False):
-                    continue
-                image_url = image['url']
-                file_name = image_url.rsplit('/', 1)[-1]
-                file_path = os.path.join(parent_dir, file_name)
-                if os.path.exists(file_path):
-                    sync_db.set_illust_fetched(illust_id, i)
-                    continue
-                image_jobs.append(FetchImageJob(
-                    file_path=file_path,
-                    image_url=image_url,
-                    illust_id=illust_id,
-                    image_id=i,
-                ))
-        image_jobs.sort(key=lambda o: o.file_path)
+    # parse single page illust
+    p_data = illust['meta_single_page']
+    if p_data:
+        images.append(filter_dict({
+            'url': p_data['original_image_url'],
+        }))
+    else:
+        for p_data in illust['meta_pages']:
+            images.append(filter_dict({
+                'url': p_data['image_urls']['original'],
+            }))
 
-        # download the images
-        if image_jobs:
-            print(f'Fetching {len(image_jobs)} images ...')
-            process = CrawlerProcess()
-            process.crawl(PixivImagesSpider, config, sync_db, image_jobs)
-            process.start()
+    r = filter_dict({
+        'id': str(illust['id']),
+        'title': illust['title'],
+        'create_time': illust['create_date'],
+        'author_id': str(illust['user']['id']),
+        'author_name': illust['user']['name'],
+        'tags': get_tags(illust),
+        'width': illust.get('width', None),
+        'height': illust.get('height', None),
+        'images': images,
+    })
+    return r
 
 
-@pixiv_sync.command()
-@click.option('-C', '--config-file', help='The YAML config file.',
-              default='config.yml', required=True)
-@click.argument('illust_ids', nargs=-1)
-def info(config_file, illust_ids):
-    """Show illust info."""
-    config = load_config_file(config_file)
-    sync_db = SyncDB(config['sync.db'])
+def update_list(sync_db: SyncDB, config: Dict[str, Any]):
+    """Pull the new illustrations that should be downloaded."""
+    api = make_api_client(sync_db)
 
-    with sync_db:
-        for illust_id in illust_ids:
-            title = f'Info for {illust_id}'
-            print(title + '\n' + '-' * len(title))
-            pprint(sync_db.get_illust(illust_id))
-            print('')
+    # get new illustrations list
+    for author_id_or_url in config.get('authors', []):
+        author_id = None
+        for pattern in AUTHOR_ID_PATTERNS:
+            m = pattern.match(author_id_or_url)
+            if m:
+                author_id = m.group(1)
+                break
+        if author_id is None:
+            raise ValueError(f'No author ID can be recognized from: '
+                             f'{author_id_or_url}')
+
+        print(f'> Pull from: {author_id_or_url}')
+        offset = 0
+        new_illusts = 0
+        try:
+            while True:
+                r = api.user_illusts(author_id, offset=offset)
+                if 'error' in r:
+                    raise Exception(r['error']['message'] or r['error']['user_message'])
+                illusts = r['illusts']
+                if not illusts:
+                    break
+                for illust in illusts:
+                    illust_id = str(illust['id'])
+                    if not sync_db.get_illust(illust_id):
+                        item = extract_illust_data(illust)
+                        item['_deleted'] = is_illust_excluded(config, item)
+                        if item:
+                            sync_db.update_illust(illust_id, item)
+                            new_illusts += 1
+                offset += len(illusts)
+
+        except Exception:
+            print(''.join(traceback.format_exception(*sys.exc_info())) +
+                  f'Failed to call `api.user_illusts`: user_id={author_id}, '
+                  f'offset={offset}.')
+
+        print(f'Discovered {new_illusts} new illusts.')
+
+    # update "_deleted"
+    for illust_id in sync_db.get_illust_ids():
+        illust = sync_db.get_illust(illust_id, {})
+        sync_db.update_illust(
+            illust_id,
+            {'_deleted': is_illust_excluded(config, illust)}
+        )
+
+
+@dataclass
+class FetchImageJob(object):
+    file_path: str
+    image_url: str
+    illust_id: str
+    image_id: int
+
+
+def fetch_images(sync_db: SyncDB, download_dir: str, n_workers: int):
+    api = make_api_client(sync_db)
+
+    # get the jobs of fetch images
+    image_jobs: List[FetchImageJob] = []
+    for illust_id in sync_db.get_illust_ids():
+        illust = sync_db.get_illust(illust_id, {})
+        if illust.get('_deleted', False):
+            continue
+
+        author_name = illust['author_name']
+        parent_dir = os.path.join(download_dir, author_name)
+
+        images = illust.get('images', [])
+        if len(images) > 1:
+            parent_dir = os.path.join(parent_dir, illust_id)
+        for i, image in enumerate(
+                sync_db.get_illust(illust_id, {}).get('images')):
+            if image.get('fetched', False):
+                continue
+            image_url = image['url']
+            file_name = image_url.rsplit('/', 1)[-1]
+            file_path = os.path.join(parent_dir, file_name)
+            image_jobs.append(FetchImageJob(
+                file_path=file_path,
+                image_url=image_url,
+                illust_id=illust_id,
+                image_id=i,
+            ))
+    image_jobs.sort(key=lambda o: o.file_path)
+    f_lock = threading.RLock()
+    counter = [len(image_jobs)]
+
+    def f_download(job: FetchImageJob):
+        parent_dir, name = os.path.split(job.file_path)
+        try:
+            os.makedirs(parent_dir, exist_ok=True)
+            api.download(
+                url=job.image_url,
+                path=parent_dir,
+                name=name,
+                replace=True,
+            )
+        except:
+            try:
+                os.remove(job.file_path)
+            except Exception:
+                pass
+            print(''.join(traceback.format_exception(*sys.exc_info())) +
+                  f'Failed to download: {job.image_url}')
+        else:
+            with f_lock:
+                counter[0] -= 1
+                sync_db.set_illust_fetched(job.illust_id, job.image_id)
+                print(f'[{counter[0]}/{len(image_jobs)}] done: {job.image_url}')
+
+    if image_jobs:
+        print(f'> Fetching {len(image_jobs)} images ...')
+        pool = ThreadPool(processes=n_workers)
+        pool.map(f_download, image_jobs)
+        pool.close()
+        pool.join()
 
 
 def _remove_illust(download_dir, sync_db, illust_ids):
@@ -608,6 +420,69 @@ def _remove_illust(download_dir, sync_db, illust_ids):
             sync_db.update_illust(illust_id, {'_deleted': True})
 
 
+def _count_db(sync_db, download_dir):
+    counts = {
+        'illust': [],
+        'deleted_illust': [],
+        'images': [],
+        'deleted_images': [],
+        'not_exist_images': [],
+        'not_deleted_images': [],
+    }
+    for illust_id in sync_db.get_illust_ids():
+        illust = sync_db.get_illust(illust_id, {})
+        deleted = illust.get('_deleted')
+        counts['deleted_illust' if deleted else 'illust'].append(illust_id)
+
+        author_name = illust['author_name']
+        parent_dir = os.path.join(download_dir, author_name)
+        images = illust.get('images', [])
+        if len(images) > 1:
+            parent_dir = os.path.join(parent_dir, illust_id)
+
+        for i, image in enumerate(images):
+            image_url = image['url']
+            file_name = image_url.rsplit('/', 1)[-1]
+            file_path = os.path.join(parent_dir, file_name)
+
+            if os.path.exists(file_path):
+                counts['not_deleted_images' if deleted else 'images'].append(file_path)
+            else:
+                counts['deleted_images' if deleted else 'not_exist_images'].append(file_path)
+
+    return counts
+
+
+@pixiv_sync.command()
+@click.option('-C', '--config-file', help='The YAML config file.',
+              default='config.yml', required=True)
+@click.argument('username', type=str, required=True)
+@click.argument('password', type=str, required=True)
+def login(config_file, username, password):
+    """Login with username and password and obtain authentication token."""
+    config = load_config_file(config_file)
+    with SyncDB(config['sync.db']) as sync_db:
+        api = AppPixivAPI()
+        token = api.login(username, password)['response']
+        pprint(token)
+        sync_db.set_token(token)
+
+
+@pixiv_sync.command()
+@click.option('-C', '--config-file', help='The YAML config file.',
+              default='config.yml', required=True)
+def sync(config_file):
+    """Synchronize the illustrations."""
+    config = load_config_file(config_file)
+    download_dir = os.path.abspath(config['download.dir'])
+    n_workers = config.get('download.workers', 8)
+
+    with SyncDB(config['sync.db']) as sync_db:
+        update_list(sync_db, config)
+        print('')
+        fetch_images(sync_db, download_dir, n_workers)
+
+
 @pixiv_sync.command()
 @click.option('-C', '--config-file', help='The YAML config file.',
               default='config.yml', required=True)
@@ -650,39 +525,6 @@ def remove_excluded(config_file, simulate, show_info):
             _remove_illust(download_dir, sync_db, delete_ids)
 
 
-def _count_db(sync_db, download_dir):
-    counts = {
-        'illust': [],
-        'deleted_illust': [],
-        'images': [],
-        'deleted_images': [],
-        'not_exist_images': [],
-        'not_deleted_images': [],
-    }
-    for illust_id in sync_db.get_illust_ids():
-        illust = sync_db.get_illust(illust_id, {})
-        deleted = illust.get('_deleted')
-        counts['deleted_illust' if deleted else 'illust'].append(illust_id)
-
-        author_name = illust['author_name']
-        parent_dir = os.path.join(download_dir, author_name)
-        images = illust.get('images', [])
-        if len(images) > 1:
-            parent_dir = os.path.join(parent_dir, illust_id)
-
-        for i, image in enumerate(images):
-            image_url = image['url']
-            file_name = image_url.rsplit('/', 1)[-1]
-            file_path = os.path.join(parent_dir, file_name)
-
-            if os.path.exists(file_path):
-                counts['not_deleted_images' if deleted else 'images'].append(file_path)
-            else:
-                counts['deleted_images' if deleted else 'not_exist_images'].append(file_path)
-
-    return counts
-
-
 @pixiv_sync.command()
 @click.option('-C', '--config-file', help='The YAML config file.',
               default='config.yml', required=True)
@@ -695,25 +537,6 @@ def count(config_file):
     with sync_db:
         counts = _count_db(sync_db, download_dir)
         pprint({k: len(counts[k]) for k in counts})
-
-
-@pixiv_sync.command()
-@click.option('-C', '--config-file', help='The YAML config file.',
-              default='config.yml', required=True)
-@click.option('--full-sync', is_flag=True, default=False)
-def sync(config_file, full_sync):
-    # first, check the login token
-    config = load_config_file(config_file)
-    sync_db = SyncDB(config['sync.db'])
-    cookies = sync_db.get_cookies()
-    if cookies and PIXIV_TOKEN_COOKIE_NAME in cookies:
-        _ = get_logged_in_user_id(cookies)
-
-    # next, do synchronization
-    args_prefix = [sys.executable, os.path.abspath(__file__)]
-    sync_list_args = ['--full-sync'] if full_sync else []
-    subprocess.check_call(args_prefix + ['sync-list', '-C', config_file] + sync_list_args)
-    subprocess.check_call(args_prefix + ['sync-images', '-C', config_file])
 
 
 if __name__ == '__main__':

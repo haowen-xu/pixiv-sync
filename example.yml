@@ -2,6 +2,7 @@
 
 sync.db: ./var/db.json  # path of the sync database
 download.dir: ./var/images  # root path the download directory
+# download.workers: 8  # number of workers to fetch images
 
 http.headers:
 
